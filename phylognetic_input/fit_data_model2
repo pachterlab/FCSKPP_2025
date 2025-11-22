@@ -1,0 +1,670 @@
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+    library(optparse)
+    library(ape)
+    library(optimx)
+    library(numDeriv)
+    library(expm)
+})
+
+LOG_FILE <- paste0("log_ml_", Sys.Date(), ".log")
+log_msg <- function(msg) {
+    timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    entry <- paste(timestamp, "-", msg, "\n")
+    cat(entry)
+    cat(entry, file = LOG_FILE, append = TRUE)
+}
+
+log_msg("=== 2D POPULATION THETA ML SCRIPT STARTED (MODEL 2, WITH OPTIONAL ME) ===")
+
+option_list <- list(
+    make_option(c("--optimizer"), default="Nelder-Mead"),
+    make_option(c("--max_iter"), type="integer", default=5000),
+    make_option(c("--reltol"), type="numeric", default=1e-8),
+    make_option(c("--n_starts"), type="integer", default=30),
+    make_option(c("--species_col"), default="species")
+)
+args <- parse_args(OptionParser(option_list=option_list))
+
+log_msg(paste("Using optimizer:", args$optimizer))
+log_msg(paste("Number of starting points:", args$n_starts))
+
+
+make_positive_definite <- function(M) {
+    M <- (M + t(M)) / 2
+    if (any(!is.finite(M))) stop("Matrix contains NaN or infinite values")
+    eigenvals <- eigen(M, symmetric = TRUE, only.values = TRUE)$values
+    min_eigenval <- min(eigenvals)
+    if (min_eigenval <= 1e-6) {
+        regularization <- 1e-4 - min_eigenval
+        diag(M) <- diag(M) + regularization
+    }
+    return(M)
+}
+
+lyapunov_ab <- function(alpha, beta, M) {
+  # Solve H V + V H^T = M for H = matrix(c(alpha, 0, -beta, beta), 2, 2)
+  M11 <- M[1,1]
+  M12 <- M[1,2]
+  M22 <- M[2,2]
+
+  v11 <- M11 / (2 * alpha)
+  v12 <- (M12 + beta * v11) / (alpha + beta)
+  v22 <- M22 / (2 * beta) + v12
+
+  V <- matrix(c(v11, v12, v12, v22), 2, 2)
+  return(V)
+}
+
+# Build 2x2 OU covariance blocks (returns N x N x 2 x 2 array)
+build_2d_ou_cov_matrix_general <- function(vcv_bm, alpha, beta, sigma_x1, sigma_x2) {
+    if (!is.matrix(vcv_bm)) vcv_bm <- as.matrix(vcv_bm)
+    if (nrow(vcv_bm) != ncol(vcv_bm)) stop("vcv_bm must be square")
+    if (!is.numeric(vcv_bm)) vcv_bm <- matrix(as.numeric(vcv_bm), nrow(vcv_bm), ncol(vcv_bm))
+    
+    N <- nrow(vcv_bm)
+    H <- matrix(c(alpha, 0, -beta, beta), 2, 2, byrow = TRUE)
+    Sigma <- diag(c(sigma_x1, sigma_x2))
+    M <- Sigma %*% t(Sigma)
+    V_stat <- lyapunov_ab(alpha, beta, M)
+    
+    unique_times <- unique(as.vector(vcv_bm))
+    exp_cache <- list()
+    for (t_val in unique_times) {
+        if (!is.finite(t_val) || length(t_val) == 0) next
+        exp_cache[[as.character(t_val)]] <- expm(-H * t_val)
+    }
+    vcv_ou <- array(0, dim = c(N, N, 2, 2))
+    
+    for (i in 1:N) {
+        t_i <- vcv_bm[i,i]
+        if (length(t_i) == 0 || !is.finite(t_i)) stop("Invalid tip time for tip i")
+        exp_neg_H_ti <- exp_cache[[as.character(t_i)]]; if (is.null(exp_neg_H_ti)) exp_neg_H_ti <- expm(-H * t_i)
+        vcv_diag <- V_stat - exp_neg_H_ti %*% V_stat %*% t(exp_neg_H_ti)
+        vcv_ou[i,i,,] <- vcv_diag
+        
+        if (i > 1) {
+            for (j in 1:(i-1)) {
+                t_j <- vcv_bm[j,j]
+                t_mrca <- vcv_bm[i,j]
+                
+                if (length(t_mrca) == 0 || !is.finite(t_mrca)) stop(sprintf("Invalid MRCA time for pair (%d,%d)", i, j))
+                if (t_mrca < -1e-12) stop("Negative MRCA time")
+                
+                exp_neg_H_tj <- exp_cache[[as.character(t_j)]]; if (is.null(exp_neg_H_tj)) exp_neg_H_tj <- expm(-H * t_j)
+                exp_neg_H_tmrca <- exp_cache[[as.character(t_mrca)]]; if (is.null(exp_neg_H_tmrca)) exp_neg_H_tmrca <- expm(-H * t_mrca)
+                
+                I_branch <- V_stat - exp_neg_H_tmrca %*% V_stat %*% t(exp_neg_H_tmrca)
+                
+                dt_i <- t_i - t_mrca
+                dt_j <- t_j - t_mrca
+                if (dt_i < -1e-12 || dt_j < -1e-12) stop("Negative delta times")
+                
+                exp_neg_H_dt_i <- expm(-H * dt_i)
+                exp_neg_H_dt_j <- expm(-H * dt_j)
+                
+                vcv_offdiag <- exp_neg_H_dt_i %*% I_branch %*% t(exp_neg_H_dt_j)
+                vcv_ou[i,j,,] <- vcv_offdiag
+                vcv_ou[j,i,,] <- t(vcv_offdiag)
+            }
+        }
+    }
+    return(vcv_ou)
+}
+
+# Precompute trait-invariant OU pieces (but do NOT add ME here)
+precompute_ou_cov_pieces <- function(vcv_bm, alpha, beta, sigma_x1, sigma_x2,
+                                    theta_mu_pop_sd, theta_b_pop_sd) {
+    N <- nrow(vcv_bm)
+    vcv_ou <- build_2d_ou_cov_matrix_general(vcv_bm, alpha, beta, sigma_x1, sigma_x2)
+    
+    # mu_theta_coeff (2N x 2) using H for model 2
+    H <- matrix(c(alpha, 0, -beta, beta), 2, 2, byrow = TRUE)
+    mu_theta_coeff <- matrix(0, 2 * N, 2)
+    for (i in 1:N) {
+        t_i <- vcv_bm[i,i]
+        exp_neg_H_ti <- expm(-H * t_i)
+        mean_coeff <- diag(2) - exp_neg_H_ti
+        mu_theta_coeff[(i-1)*2 + 1, ] <- mean_coeff[1, ]
+        mu_theta_coeff[(i-1)*2 + 2, ] <- mean_coeff[2, ]
+    }
+    
+    theta_pop_cov_2d_raw <- matrix(c(
+        theta_b_pop_sd^2, theta_b_pop_sd^2,
+        theta_b_pop_sd^2, theta_b_pop_sd^2 + theta_mu_pop_sd^2
+    ), 2, 2)
+    theta_pop_cov_2d <- make_positive_definite(theta_pop_cov_2d_raw)
+    
+    return(list(
+        vcv_ou = vcv_ou,
+        mu_theta_coeff = mu_theta_coeff,
+        theta_pop_cov_2d = theta_pop_cov_2d,
+        N = N,
+        success = TRUE
+    ))
+}
+
+# Precompute noise pieces (trait-invariant theta-population Kronecker)
+precompute_noise_pieces <- function(N, theta_mu_pop_sd, theta_b_pop_sd) {
+    theta_cov_2d_raw <- matrix(c(
+        theta_b_pop_sd^2, theta_b_pop_sd^2,
+        theta_b_pop_sd^2, theta_b_pop_sd^2 + theta_mu_pop_sd^2
+    ), 2, 2)
+    theta_cov_2d <- make_positive_definite(theta_cov_2d_raw)
+    Sigma_theta_all <- kronecker(matrix(1, nrow = N, ncol = N), theta_cov_2d)
+    return(list(Sigma_theta_all = Sigma_theta_all, theta_cov_2d = theta_cov_2d, N = N, success = TRUE))
+}
+
+# Fast single-trait OU log-likelihood: build full marginal covariance for the trait (including ME) and evaluate
+fast_single_trait_ou_ll <- function(y_vec, pieces_ou, me_var_vec, theta_mu_pop_mean, theta_b_pop_mean) {
+    if (!pieces_ou$success) return(-1e10)
+    N <- pieces_ou$N
+    
+    # build Sigma_obs from vcv_ou
+    Sigma_obs <- matrix(0, 2*N, 2*N)
+    for (i in 1:N) {
+        for (j in 1:N) {
+            row_start <- (i-1)*2 + 1
+            col_start <- (j-1)*2 + 1
+            Sigma_obs[row_start:(row_start+1), col_start:(col_start+1)] <- pieces_ou$vcv_ou[i,j,,]
+        }
+    }
+    # add measurement error variances (me_var_vec length 2N)
+    if (length(me_var_vec) != 2*N) stop("me_var_vec length mismatch in OU ll")
+    Sigma_obs <- Sigma_obs + diag(me_var_vec)
+    
+    # add theta population contribution via mu_theta_coeff
+    Sigma_marginal_raw <- Sigma_obs + pieces_ou$mu_theta_coeff %*% pieces_ou$theta_pop_cov_2d %*% t(pieces_ou$mu_theta_coeff)
+    Sigma_marginal <- make_positive_definite(Sigma_marginal_raw)
+    
+    L <- tryCatch(chol(Sigma_marginal), error = function(e) NULL)
+    if (is.null(L)) return(-1e10)
+    log_det <- 2 * sum(log(diag(L)))
+    
+    # marginal mean: theta_b, theta_b - theta_mu
+    theta_pop_mean_2d <- c(theta_b_pop_mean <- theta_b_pop_mean <- theta_b_pop_mean <- NA) # placeholder to avoid check below
+    # But use provided names:
+    theta_pop_mean_2d <- c(theta_b_pop_mean, theta_b_pop_mean - theta_mu_pop_mean)
+    mu_marginal <- pieces_ou$mu_theta_coeff %*% theta_pop_mean_2d
+    
+    residual <- y_vec - mu_marginal
+    quad_form <- sum((backsolve(L, residual, transpose = TRUE))^2)
+    ll <- -0.5 * (length(y_vec) * log(2*pi) + log_det + quad_form)
+    if (!is.finite(ll)) return(-1e10)
+    return(ll)
+}
+
+# Fast single-trait noise LL: build full noise covariance including ME + sigma_noise^2
+fast_single_trait_noise_ll <- function(y_vec, pieces_noise, me_var_vec, sigma_noise1, sigma_noise2, theta_mu_pop_mean, theta_b_pop_mean) {
+    if (!pieces_noise$success) return(-1e10)
+    N <- pieces_noise$N
+    if (length(me_var_vec) != 2*N) stop("me_var_vec length mismatch in noise ll")
+    
+    meas_diag_vals <- numeric(2*N)
+    for (i in 1:N) {
+        meas_diag_vals[(i-1)*2 + 1] <- sigma_noise1^2 + me_var_vec[(i-1)*2 + 1] # b
+        meas_diag_vals[(i-1)*2 + 2] <- sigma_noise2^2 + me_var_vec[(i-1)*2 + 2] # gamma
+    }
+    meas_diag <- diag(meas_diag_vals)
+    Sigma_noise_full <- pieces_noise$Sigma_theta_all + meas_diag
+    Sigma_noise_pd <- make_positive_definite(Sigma_noise_full)
+    
+    L <- tryCatch(chol(Sigma_noise_pd), error = function(e) NULL)
+    if (is.null(L)) return(-1e10)
+    log_det <- 2 * sum(log(diag(L)))
+    
+    mu_noise <- rep(c(theta_b_pop_mean, theta_b_pop_mean - theta_mu_pop_mean), N)
+    residual <- y_vec - mu_noise
+    quad_form <- sum((backsolve(L, residual, transpose = TRUE))^2)
+    ll <- -0.5 * (length(y_vec) * log(2*pi) + log_det + quad_form)
+    if (!is.finite(ll)) return(-1e10)
+    return(ll)
+}
+
+# Mixture likelihood over all traits (requires me_array: n_tips x n_traits x 2, ME in stds)
+fast_mixture_likelihood_all_traits <- function(y_array, vcv_bm, alpha, beta, sigma_x1, sigma_x2,
+                                              sigma_noise1, sigma_noise2, p_noise,
+                                              theta_mu_pop_mean, theta_mu_pop_sd,
+                                              theta_b_pop_mean, theta_b_pop_sd,
+                                              me_array) {
+    N <- nrow(y_array)
+    n_traits <- ncol(y_array)
+    
+    pieces_ou <- precompute_ou_cov_pieces(vcv_bm, alpha, beta, sigma_x1, sigma_x2,
+                                         theta_mu_pop_sd, theta_b_pop_sd)
+    pieces_noise <- precompute_noise_pieces(N, theta_mu_pop_sd, theta_b_pop_sd)
+    if (!pieces_ou$success || !pieces_noise$success) return(-1e10)
+    
+    total_ll <- 0
+    for (k in 1:n_traits) {
+        y_vec <- numeric(2*N)
+        me_var_vec <- numeric(2*N)
+        for (i in 1:N) {
+            y_vec[(i-1)*2 + 1] <- y_array[i, k, 1]
+            y_vec[(i-1)*2 + 2] <- y_array[i, k, 2]
+            me_sd_b <- me_array[i, k, 1]
+            me_sd_g <- me_array[i, k, 2]
+            me_var_vec[(i-1)*2 + 1] <- ifelse(is.na(me_sd_b) || !is.finite(me_sd_b), 0.0, me_sd_b^2)
+            me_var_vec[(i-1)*2 + 2] <- ifelse(is.na(me_sd_g) || !is.finite(me_sd_g), 0.0, me_sd_g^2)
+        }
+        
+        ll_ou <- fast_single_trait_ou_ll(y_vec, pieces_ou, me_var_vec, theta_mu_pop_mean, theta_b_pop_mean)
+        ll_noise <- fast_single_trait_noise_ll(y_vec, pieces_noise, me_var_vec,
+                                               sigma_noise1, sigma_noise2,
+                                               theta_mu_pop_mean, theta_b_pop_mean)
+        
+        if (ll_ou > ll_noise) {
+            ll_k <- ll_ou + log(1 - p_noise + p_noise * exp(ll_noise - ll_ou))
+        } else {
+            ll_k <- ll_noise + log(p_noise + (1 - p_noise) * exp(ll_ou - ll_noise))
+        }
+        if (!is.finite(ll_k)) return(-1e10)
+        total_ll <- total_ll + ll_k
+    }
+    return(total_ll)
+}
+
+compute_phylo_mean_2d <- function(trait_values, tree) {
+    tryCatch({
+        vcov_matrix <- ape::vcv(tree)
+        det_vcov <- det(vcov_matrix)
+        if (abs(det_vcov) < 1e-10) {
+            warning("VCV matrix near singular, using arithmetic mean")
+            return(apply(trait_values, 1, mean, na.rm = TRUE))
+        }
+        vcov_inv <- solve(vcov_matrix)
+        ones <- rep(1, ncol(trait_values))
+        phylo_means <- numeric(2)
+        for (d in 1:2) {
+            trait_d <- trait_values[d, ]
+            phylo_means[d] <- as.numeric((t(ones) %*% vcov_inv %*% trait_d) / (t(ones) %*% vcov_inv %*% ones))
+        }
+        return(phylo_means)
+    }, error = function(e) {
+        warning("Phylogenetic mean calculation failed, using arithmetic mean: ", e$message)
+        return(apply(trait_values, 1, mean, na.rm = TRUE))
+    })
+}
+
+# Parameter transforms
+params_to_unconstrained <- function(alpha, beta, sigma_x1, sigma_x2, sigma_noise1, sigma_noise2,
+                                   p_noise, theta_mu_pop_mean, theta_mu_pop_sd,
+                                   theta_b_pop_mean, theta_b_pop_sd) {
+    c(log(alpha), log(beta), log(sigma_x1), log(sigma_x2),
+      log(sigma_noise1), log(sigma_noise2), qlogis(p_noise),
+      theta_mu_pop_mean, log(theta_mu_pop_sd),
+      theta_b_pop_mean, log(theta_b_pop_sd))
+}
+
+unconstrained_to_params <- function(x) {
+    list(
+        alpha = exp(x[1]),
+        beta = exp(x[2]),
+        sigma_x1 = exp(x[3]),
+        sigma_x2 = exp(x[4]),
+        sigma_noise1 = exp(x[5]),
+        sigma_noise2 = exp(x[6]),
+        p_noise = plogis(x[7]),
+        theta_mu_pop_mean = x[8],
+        theta_mu_pop_sd = exp(x[9]),
+        theta_b_pop_mean = x[10],
+        theta_b_pop_sd = exp(x[11])
+    )
+}
+
+load_trait_csv <- function(file_path, file_type = "trait") {
+    log_msg(paste("Loading", file_type, "data from:", file_path))
+    
+    first_line <- readLines(file_path, n = 1)
+    cat("First line of", file_type, "file:", first_line, "\n")
+    first_parts <- strsplit(trimws(first_line), "\\s+")[[1]]
+    first_parts_clean <- gsub("^#", "", first_parts)
+
+    is_dimension_line <- length(first_parts_clean) == 2 && 
+                        all(grepl("^\\d+$", trimws(first_parts_clean)))
+    
+    if (is_dimension_line) {
+        n_species <- as.numeric(trimws(first_parts_clean[1]))
+        n_traits <- as.numeric(trimws(first_parts_clean[2]))
+        log_msg(paste("Detected dimension header:", n_species, "species,", n_traits, "traits"))
+        
+        data_matrix <- read.csv(file_path, skip = 1, header = FALSE, stringsAsFactors = FALSE, sep = ' ')
+        colnames(data_matrix) <- c("species", paste0("trait", 1:n_traits))
+    } else {
+        log_msg("Standard CSV format detected")
+        data_matrix <- read.csv(file_path, stringsAsFactors = FALSE)
+    }
+    
+    return(data_matrix)
+}
+
+process_single_file_ml <- function(b_file, gamma_file, error_b_file, error_gamma_file, optimizer, max_iter, reltol, n_starts) {
+
+    library(ape); library(tools); library(optimx)
+
+    trait_b <- load_trait_csv(b_file, "dimension 1 (b)")
+    trait_gamma <- load_trait_csv(gamma_file, "dimension 2 (gamma)")
+  
+    error_b <- load_trait_csv(error_b_file, "error 1 (b)")
+    error_gamma <- load_trait_csv(error_gamma_file, "error 2 (gamma)")
+
+
+    # ---------------------------
+    # Read fixed tree (unchanged)
+    # ---------------------------
+    newick_tree <- "(Frog:351.68654000,(Pig:94.00000000,((Rat:11.64917000,Mouse:11.64917000)'14':75.55083000,(Human:28.82000000,Macaque:28.82000000)'13':58.38000000)'25':6.80000000)'37':257.68654000);"
+    tree <- read.tree(text = newick_tree)
+    tree$node.label <- NULL
+
+    tree_height <- max(vcv(tree)[1, ])
+    tree$edge.length <- tree$edge.length / tree_height
+
+    # ---------------------------
+    # Ensure species column names
+    # ---------------------------
+    if (!args$species_col %in% colnames(trait_b)) colnames(trait_b)[1] <- args$species_col
+    if (!args$species_col %in% colnames(trait_gamma)) colnames(trait_gamma)[1] <- args$species_col
+    if (!is.null(error_b) && !args$species_col %in% colnames(error_b)) colnames(error_b)[1] <- args$species_col
+    if (!is.null(error_gamma) && !args$species_col %in% colnames(error_gamma)) colnames(error_gamma)[1] <- args$species_col
+
+    # ---------------------------
+    # Match species across all datasets and tree
+    # ---------------------------
+    species_list <- list(tree$tip.label, trait_b[[args$species_col]], trait_gamma[[args$species_col]])
+    if (!is.null(error_b)) species_list <- c(species_list, list(error_b[[args$species_col]]))
+    if (!is.null(error_gamma)) species_list <- c(species_list, list(error_gamma[[args$species_col]]))
+
+    common_species <- Reduce(intersect, species_list)
+    log_msg(paste("Using", length(common_species), "species present in tree and all datasets"))
+
+    tree <- keep.tip(tree, common_species)
+    trait_b <- trait_b[match(tree$tip.label, trait_b[[args$species_col]]), ]
+    trait_gamma <- trait_gamma[match(tree$tip.label, trait_gamma[[args$species_col]]), ]
+    if (!is.null(error_b)) error_b <- error_b[match(tree$tip.label, error_b[[args$species_col]]), ]
+    if (!is.null(error_gamma)) error_gamma <- error_gamma[match(tree$tip.label, error_gamma[[args$species_col]]), ]
+
+    # ---------------------------
+    # Build 2D trait array
+    # ---------------------------
+    trait_cols <- setdiff(colnames(trait_b), args$species_col)
+    n_tips <- length(tree$tip.label)
+    n_traits <- length(trait_cols)
+    log_msg(paste("Number of traits:", n_traits))
+    log_msg(paste("Number of tips/species:", n_tips))
+
+    y_array <- array(0, dim = c(n_tips, n_traits, 2))
+    for (i in 1:n_tips) {
+        for (k in 1:n_traits) {
+            y_array[i, k, 1] <- trait_b[i, trait_cols[k]]       # dimension 1 (b)
+            y_array[i, k, 2] <- trait_gamma[i, trait_cols[k]]   # dimension 2 (gamma)
+        }
+    }
+    log_msg("2D trait array constructed successfully")
+
+    # ---------------------------
+    # Build measurement-error array: same dims as y_array
+    # Values in the files are std devs -> convert to stored stds here, square later
+    # If not provided, array stays zeros
+    # ---------------------------
+    me_array <- array(0, dim = c(n_tips, n_traits, 2))
+    if (!is.null(error_b)) {
+        err_cols_b <- setdiff(colnames(error_b), args$species_col)
+        if (length(err_cols_b) < n_traits) stop("Error b file has fewer trait columns than trait file")
+        for (i in 1:n_tips) {
+            for (k in 1:n_traits) {
+                val <- as.numeric(error_b[i, err_cols_b[k]])
+                me_array[i, k, 1] <- ifelse(is.na(val) || !is.finite(val), 0.0, val)
+            }
+        }
+    }
+    if (!is.null(error_gamma)) {
+        err_cols_g <- setdiff(colnames(error_gamma), args$species_col)
+        if (length(err_cols_g) < n_traits) stop("Error gamma file has fewer trait columns than trait file")
+        for (i in 1:n_tips) {
+            for (k in 1:n_traits) {
+                val <- as.numeric(error_gamma[i, err_cols_g[k]])
+                me_array[i, k, 2] <- ifelse(is.na(val) || !is.finite(val), 0.0, val)
+            }
+        }
+    }
+    cat(me_array[1,1,1], 'measurement error std for first trait b\n')
+    cat(me_array[1,1,2], 'measurement error std for first trait gamma\n')
+
+    trait_list <- lapply(1:n_traits, function(k) {
+        matrix(c(y_array[, k, 1], y_array[, k, 2]), nrow = 2, byrow = TRUE)
+    })
+    
+    vcv_bm <- vcv(tree)
+    tree_height <- max(node.depth.edgelength(tree))
+    all_y1_vals <- as.vector(y_array[, , 1])
+    all_y2_vals <- as.vector(y_array[, , 2])
+    max_rate <- min(100.0, 10.0 / tree_height)
+    data_scale_1 <- sqrt(max(0.01, var(all_y1_vals, na.rm = TRUE)))
+    data_scale_2 <- sqrt(max(0.01, var(all_y2_vals, na.rm = TRUE)))
+    max_sigma <- max(data_scale_1, data_scale_2) * 10.0
+
+    # compute phylogenetic-based initials (model 2 specifics)
+    trait_phylo_means <- array(0, dim=c(n_traits, 2))
+    trait_theta_mus <- numeric(n_traits)
+    trait_theta_bs <- numeric(n_traits)
+    for (k in 1:n_traits) {
+        trait_phylo_means[k, ] <- compute_phylo_mean_2d(trait_list[[k]], tree)
+        trait_theta_bs[k] <- trait_phylo_means[k, 1]
+        trait_theta_mus[k] <- trait_phylo_means[k, 1] - trait_phylo_means[k, 2]
+    }
+    theta_mu_init_mean <- mean(trait_theta_mus, na.rm = TRUE)
+    theta_mu_init_var <- max(var(trait_theta_mus, na.rm = TRUE), 0.01)
+    theta_b_init_mean <- mean(trait_theta_bs, na.rm = TRUE)
+    theta_b_init_var <- max(var(trait_theta_bs, na.rm = TRUE), 0.01)
+
+    safe_theta_mu_mean <- if(is.finite(theta_mu_init_mean)) theta_mu_init_mean else 0.0
+    safe_theta_b_mean <- if(is.finite(theta_b_init_mean)) theta_b_init_mean else 0.0
+
+    # Objective function uses me_array
+    objective <- function(params) {
+        p <- unconstrained_to_params(params)
+        
+        # Enforce bounds (soft constraints via penalty)
+        if (p$alpha > max_rate || p$beta > max_rate || 
+            p$sigma_x1 > max_sigma || p$sigma_x2 > max_sigma ||
+            p$sigma_noise1 > max_sigma || p$sigma_noise2 > max_sigma ||
+            p$theta_mu_pop_sd > max_sigma || p$theta_b_pop_sd > max_sigma ||
+            abs(p$theta_mu_pop_mean) > max_sigma*5 || abs(p$theta_b_pop_mean) > max_sigma*5 ||
+            p$p_noise < 0.0 || p$p_noise > 0.9) {
+            return(1e10)
+        }
+
+        total_ll <- fast_mixture_likelihood_all_traits(
+            y_array, vcv_bm, p$alpha, p$beta, p$sigma_x1, p$sigma_x2,
+            p$sigma_noise1, p$sigma_noise2, p$p_noise,
+            p$theta_mu_pop_mean, p$theta_mu_pop_sd,
+            p$theta_b_pop_mean, p$theta_b_pop_sd,
+            me_array
+        )
+        
+        if (!is.finite(total_ll)) return(1e10)
+        return(-total_ll)
+    }
+
+    # Multi-start optimization
+    best_result <- NULL
+    best_ll <- -Inf
+    set.seed(123)
+    for (start_idx in 1:n_starts) {
+        cat("\n=== Starting point", start_idx, "of", n_starts, "===\n")
+        if (start_idx == 1) {
+            init_params <- params_to_unconstrained(
+                alpha = 0.5,
+                beta = 0.5,
+                sigma_x1 = pmax(0.1, data_scale_1 * 0.5),
+                sigma_x2 = pmax(0.1, data_scale_2 * 0.5),
+                sigma_noise1 = pmax(0.1, data_scale_1 * 0.3),
+                sigma_noise2 = pmax(0.1, data_scale_2 * 0.3),
+                p_noise = 0.2,
+                theta_mu_pop_mean = safe_theta_mu_mean,
+                theta_mu_pop_sd = pmax(0.1, sqrt(theta_mu_init_var)),
+                theta_b_pop_mean = safe_theta_b_mean,
+                theta_b_pop_sd = pmax(0.1, sqrt(theta_b_init_var))
+            )
+        } else {
+            init_params <- params_to_unconstrained(
+                alpha = runif(1, 0.1, 2.0),
+                beta = runif(1, 0.1, 2.0),
+                sigma_x1 = runif(1, 0.1, data_scale_1 * 2),
+                sigma_x2 = runif(1, 0.1, data_scale_2 * 2),
+                sigma_noise1 = runif(1, 0.1, data_scale_1),
+                sigma_noise2 = runif(1, 0.1, data_scale_2),
+                p_noise = runif(1, 0.05, 0.4),
+                theta_mu_pop_mean = rnorm(1, safe_theta_mu_mean, sqrt(theta_mu_init_var)),
+                theta_mu_pop_sd = runif(1, 0.1, 2 * sqrt(theta_mu_init_var)),
+                theta_b_pop_mean = rnorm(1, safe_theta_b_mean, sqrt(theta_b_init_var)),
+                theta_b_pop_sd = runif(1, 0.1, 2 * sqrt(theta_b_init_var))
+            )
+        }
+
+        cat("Initial objective value:", objective(init_params), "\n")
+
+        opt_result <- optimx(par = init_params, fn = objective, method = args$optimizer,
+                   control = list(maxit = max_iter, reltol = reltol, trace = 0))
+        
+        current_ll <- -opt_result$value[1]
+        cat("Final log-likelihood:", current_ll, "\n")
+        
+        if (current_ll > best_ll) {
+            best_ll <- current_ll
+            best_result <- opt_result
+            cat("*** New best result! ***\n")
+        }
+    }
+
+    if (is.null(best_result)) {
+        cat("Warning: No successful optimization runs\n")
+        return(NULL)
+    }
+
+    cat("\n=== Best result across all starting points ===\n")
+    cat("Best log-likelihood:", best_ll, "\n")
+    print(best_result)
+
+    best_params <- as.numeric(best_result[1, 1:11])
+    p <- unconstrained_to_params(best_params)
+    log_likelihood <- best_ll
+
+    hessian_result <- tryCatch({
+        hess <- numDeriv::hessian(objective, best_params)
+        se_params <- sqrt(diag(solve(hess)))
+        se_params
+    }, error = function(e) {
+        rep(NA, 11)
+    })
+    se_params <- hessian_result
+
+    result <- list(
+        estimates = list(
+            alpha = p$alpha,
+            beta = p$beta,
+            sigma_x1 = p$sigma_x1,
+            sigma_x2 = p$sigma_x2,
+            sigma_noise1 = p$sigma_noise1,
+            sigma_noise2 = p$sigma_noise2,
+            p_noise = p$p_noise,
+            theta_mu_pop_mean = p$theta_mu_pop_mean,
+            theta_mu_pop_sd = p$theta_mu_pop_sd,
+            theta_b_pop_mean = p$theta_b_pop_mean,
+            theta_b_pop_sd = p$theta_b_pop_sd
+        ),
+        standard_errors = list(
+            alpha_se = if(!is.na(se_params[1])) sqrt(p$alpha^2 * se_params[1]^2) else NA,
+            beta_se = if(!is.na(se_params[2])) sqrt(p$beta^2 * se_params[2]^2) else NA,
+            sigma_x1_se = if(!is.na(se_params[3])) sqrt(p$sigma_x1^2 * se_params[3]^2) else NA,
+            sigma_x2_se = if(!is.na(se_params[4])) sqrt(p$sigma_x2^2 * se_params[4]^2) else NA,
+            sigma_noise1_se = if(!is.na(se_params[5])) sqrt(p$sigma_noise1^2 * se_params[5]^2) else NA,
+            sigma_noise2_se = if(!is.na(se_params[6])) sqrt(p$sigma_noise2^2 * se_params[6]^2) else NA,
+            p_noise_se = if(!is.na(se_params[7])) abs(p$p_noise * (1-p$p_noise) * se_params[7]) else NA,
+            theta_mu_pop_mean_se = if(!is.na(se_params[8])) se_params[8] else NA,
+            theta_mu_pop_sd_se = if(!is.na(se_params[9])) sqrt(p$theta_mu_pop_sd^2 * se_params[9]^2) else NA,
+            theta_b_pop_mean_se = if(!is.na(se_params[10])) se_params[10] else NA,
+            theta_b_pop_sd_se = if(!is.na(se_params[11])) sqrt(p$theta_b_pop_sd^2 * se_params[11]^2) else NA
+        ),
+        optimization = list(
+            log_likelihood = log_likelihood,
+            aic = 2 * 11 - 2 * log_likelihood,
+            bic = log(n_traits * n_tips * 2) * 11 - 2 * log_likelihood,
+            convergence_code = best_result$convcode,
+            n_iterations = best_result$fevals,
+            optimizer = args$optimizer,
+            n_starts = n_starts
+        ),
+        data_info = list(n_traits = n_traits, n_tips = n_tips, tree_height = tree_height),
+        theta_init_info = list(theta_mu_mean = theta_mu_init_mean, theta_mu_var = theta_mu_init_var,
+                               theta_b_mean = theta_b_init_mean, theta_b_var = theta_b_init_var),
+        timing = list(optimization = NA),
+        settings = list(mixture_model = "2D-OU-Gaussian-ComponentTheta-ML-WithME-model2", n_parameters = 11, 
+                       parameterization = "2d_component_theta_model2", measurement_error = TRUE)
+    )
+
+    # Trait classification using ME-corrected pieces
+    pieces_ou_final <- precompute_ou_cov_pieces(vcv_bm, p$alpha, p$beta, p$sigma_x1, p$sigma_x2,
+                                               p$theta_mu_pop_sd, p$theta_b_pop_sd)
+    pieces_noise_final <- precompute_noise_pieces(n_tips, p$theta_mu_pop_sd, p$theta_b_pop_sd)
+    
+    trait_probs <- matrix(0, n_traits, 2)
+    for (k in 1:n_traits) {
+        y_vec <- numeric(2*n_tips)
+        me_var_vec <- numeric(2*n_tips)
+        for (i in 1:n_tips) {
+            y_vec[(i-1)*2 + 1] <- y_array[i, k, 1]
+            y_vec[(i-1)*2 + 2] <- y_array[i, k, 2]
+            me_sd_b <- me_array[i, k, 1]; me_sd_g <- me_array[i, k, 2]
+            me_var_vec[(i-1)*2 + 1] <- ifelse(is.na(me_sd_b) || !is.finite(me_sd_b), 0.0, me_sd_b^2)
+            me_var_vec[(i-1)*2 + 2] <- ifelse(is.na(me_sd_g) || !is.finite(me_sd_g), 0.0, me_sd_g^2)
+        }
+        
+        ll_ou <- suppressWarnings(fast_single_trait_ou_ll(y_vec, pieces_ou_final, me_var_vec, 
+                                                          p$theta_mu_pop_mean, p$theta_b_pop_mean))
+        ll_noise <- suppressWarnings(fast_single_trait_noise_ll(y_vec, pieces_noise_final, me_var_vec,
+                                                                p$sigma_noise1, p$sigma_noise2,
+                                                                p$theta_mu_pop_mean, p$theta_b_pop_mean))
+        
+        log_p_ou_post <- log(1 - p$p_noise) + ll_ou
+        log_p_noise_post <- log(p$p_noise) + ll_noise
+        if (log_p_ou_post > log_p_noise_post) {
+            log_normalizer <- log_p_ou_post + log(1 + exp(log_p_noise_post - log_p_ou_post))
+        } else {
+            log_normalizer <- log_p_noise_post + log(1 + exp(log_p_ou_post - log_p_noise_post))
+        }
+        trait_probs[k, 1] <- exp(log_p_ou_post - log_normalizer)
+        trait_probs[k, 2] <- exp(log_p_noise_post - log_normalizer)
+    }
+
+    result$trait_classification <- list(
+        trait_ou_prob = trait_probs[, 1],
+        trait_noise_prob = trait_probs[, 2],
+        mean_noise_prob = mean(trait_probs[, 2]),
+        n_likely_noise = sum(trait_probs[, 2] > 0.5),
+        max_noise_prob = max(trait_probs[, 2])
+    )
+
+    output_file <- "data_fit_model2_with_me_2.rds"
+    suppressWarnings(saveRDS(result, output_file))
+    cat("Saved results to", output_file, "\n")
+    return(output_file)
+}
+
+# Main loop
+cat("Processing files... \n")
+overall_start <- Sys.time()
+
+b_file <- "trait_b"
+gamma_file <- "trait_gamma"
+b_error_file <- "error_b"
+gamma_error_file <- "error_gamma"
+
+all_results <- process_single_file_ml(b_file, gamma_file, b_error_file, gamma_error_file, args$optimizer, args$max_iter, args$reltol, args$n_starts)
+total_time <- difftime(Sys.time(), overall_start, units="mins")
+
+cat("Done.\n")
+cat(paste("Processed in", round(total_time, 2), "minutes\n"))
+
+log_msg("=== SCRIPT COMPLETED ===")
