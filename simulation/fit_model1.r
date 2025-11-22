@@ -19,7 +19,7 @@ log_msg <- function(msg) {
 log_msg("=== 2D POPULATION THETA ML SCRIPT STARTED (NO ME OPTIMIZATION) ===")
 
 option_list <- list(
-    make_option(c("-i", "--input_dir"), default="sim2_UB_40_fit1"),
+    make_option(c("-i", "--input_dir"), default="sim1"),
     make_option(c("--max_files"), type="integer", default=NULL),
     make_option(c("--optimizer"), default="Nelder-Mead"),
     make_option(c("--max_iter"), type="integer", default=2500),
