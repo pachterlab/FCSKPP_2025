@@ -1,0 +1,468 @@
+#!/usr/bin/env Rscript
+
+# Load required libraries
+suppressPackageStartupMessages({
+  library(optparse)
+  library(ape)
+  library(PCMBase)
+  library(data.table)
+  library(RRphylo)
+})
+
+# 1. Filter the list of parametrizations to avoid generating too many S3 methods.
+# (note that we could do the same type of filtering for the other parameters).
+listParameterizationsBM <- PCMListParameterizations(structure(0.0, class="OU"))
+listParameterizationsBM$Theta <- listParameterizationsBM$Theta[1:2]
+listParameterizationsBM$X0 <- listParameterizationsBM$X0[1:2]
+
+# global, diagonal H.
+listParameterizationsBM$H <- listParameterizationsBM$H[13:15]
+listParameterizationsBM$Sigma_x <- listParameterizationsBM$Sigma_x[2]
+
+# 2. Generate a table of parametrizations for this list:
+dtParameterizations <- PCMTableParameterizations(
+  structure(0.0, class="OU"), listParameterizations = listParameterizationsBM)
+
+# 3. Generate the parametrizations
+PCMGenerateParameterizations(structure(0.0, class="OU"), 
+                             tableParameterizations = dtParameterizations[])
+
+# Parse command-line arguments
+parse_cmd_args <- function() {
+  option_list <- list(
+    make_option(c("-o", "--output_dir"), type="character", default="simulations",
+                help="Output directory for simulated data files"),
+    make_option(c("-t", "--tree"), type="character", default=NULL,
+                help="Newick file with phylogenetic tree (if not provided, a default tree will be used)"),
+    make_option(c("--size"), type="integer", default=NULL,
+                help="Size of tree to randomly simulate if desired (if not provided, a default tree will be used)"),
+    make_option(c("-n", "--ntraits"), type="integer", default=150,
+                help="Number of traits to simulate per repeat"),
+    make_option(c("-r", "--repeats"), type="integer", default=100,
+                help="Number of parameter combinations to simulate"),
+    make_option(c("--h_min"), type="numeric", default= 0.1,
+                help="Minimum value for selection strength parameter H"),
+    make_option(c("--h_max"), type="numeric", default= 5,
+                help="Maximum value for selection strength parameter H"),
+    make_option(c("--sigma_min"), type="numeric", default=0.5,
+                help="Minimum value for Sigma_x parameters"),
+    make_option(c("--sigma_max"), type="numeric", default=5.0,
+                help="Maximum value for Sigma_x parameters"),
+    make_option(c("--sigma_noise_min"), type="numeric", default=0.5,
+                help="Minimum value for sigma_noise parameter"),
+    make_option(c("--sigma_noise_max"), type="numeric", default=5.0,
+                help="Maximum value for sigma_noise parameter"),
+    make_option(c("--p_min"), type="numeric", default=0.1,
+                help="Minimum probability of noise traits"),
+    make_option(c("--p_max"), type="numeric", default=0.9,
+                help="Maximum probability of noise traits"),
+    make_option(c("--theta_mean"), type="numeric", default=0,
+                help="Mean of theta distribution for per-trait sampling"),
+    make_option(c("--theta_sd"), type="numeric", default=1.0,
+                help="Standard deviation of theta distribution for per-trait sampling"),
+    make_option(c("--sample_theta"), type="logical", default=TRUE,
+                help="Sample theta per trait (TRUE) vs use fixed value (FALSE)"),
+    make_option(c("--x0_follows_theta"), type="logical", default=TRUE,
+                help="Set X0 equal to theta for each trait (TRUE) vs use fixed X0 (FALSE)"),
+    make_option(c("--x0"), type="numeric", default=0,
+                help="Fixed X0 (root state) value if x0_follows_theta=FALSE"),
+    make_option(c("--me_scale"), type="numeric", default=0.0,
+                help="Scale factor for measurement error"),
+    make_option(c("--seed"), type="integer", default=NULL,
+                help="Random seed for reproducibility"),
+    make_option(c("--verbose"), type="logical", default=FALSE,
+                help="Verbose output"),
+    make_option(c("--quiet"), type="logical", default=FALSE,
+                help="Suppress most output")
+  )
+  
+  opt_parser <- OptionParser(option_list=option_list)
+  return(parse_args(opt_parser))
+}
+
+# Load or create a phylogenetic tree
+get_tree <- function(tree_file = NULL, tree_size=NULL, quiet=FALSE) {
+  if (!is.null(tree_file) && file.exists(tree_file)) {
+    tree <- read.tree(tree_file)
+    if (!quiet) cat("Using tree from:", tree_file, "\n")
+  } 
+  else if (!is.null(tree_size)) { 
+    tree <- rcoal(tree_size)
+    tree <- rescaleRR(tree, height=1)
+    if (!quiet) cat("Simulated tree with", tree_size, "tips\n")
+  }
+  else {
+    # Default tree similar to the one in the original code
+    newick_tree <- "(Xenopus_tropicalis:351.68654000,(Sus_scrofa:94.00000000,((Rattus_norvegicus:11.64917000,Mus_musculus:11.64917000)'14':75.55083000,(Homo_sapiens:28.82000000,Macaca_mulatta:28.82000000)'13':58.38000000)'25':6.80000000)'37':257.68654000);"
+    tree <- read.tree(text = newick_tree)
+    tree$node.label <- NULL
+    
+    # Normalize the tree to unit height
+    tree_height <- max(vcv(tree)[1, ])
+    tree$edge.length <- tree$edge.length / tree_height
+    tree <- rescaleRR(tree, height=1)
+    if (!quiet) cat("Using default 5-species tree\n")
+  }
+  
+  return(tree)
+}
+
+# Initialize OU model template (theta and X0 will be set per trait)
+init_model_template <- function(tree, params) {
+  # Initialize phylogenetic OU model template
+  k <- 1  # trait dimensions (fixed at 1 in this script)
+  
+  # Define OU model with scalar H and Sigma_x for 1D
+  modelOU <- PCM("OU__Global_X0__Diagonal_Global_H__Theta__Diagonal_WithNonNegativeDiagonal_Sigma_x__Omitted_Sigmae_x", k=k)
+  
+  # Set parameters that are shared across all traits
+  modelOU$H[1,1] <- params$h     # Selection strength
+  modelOU$Sigma_x[1] <- params$sigma  # Sigma
+  # Note: Theta and X0 will be set per trait in simulate_traits_mixture
+  
+  if (params$verbose) {
+    cat("Model template created - theta and X0 will be set per trait\n")
+    cat("Shared parameters:\n")
+    cat("  H =", modelOU$H[1,1], "\n")
+    cat("  Sigma_x =", modelOU$Sigma_x[1], "\n")
+    cat("Theta sampling settings:\n")
+    cat("  Sample per trait:", params$sample_theta, "\n")
+    if (params$sample_theta) {
+      cat("  Theta ~ N(", params$theta_mean, ",", params$theta_sd, ")\n")
+    } else {
+      cat("  Fixed theta =", params$theta_mean, "\n")
+    }
+    cat("  X0 follows theta:", params$x0_follows_theta, "\n")
+  }
+  
+  return(modelOU)
+}
+
+# Generate measurement error values
+generate_me_values <- function(n_traits, n_tips, k=1, scale=0.1) {
+  me_values <- list()
+  
+  for (i in 1:n_traits) {
+    # Create a matrix of measurement errors
+    me_matrix <- matrix(abs(rnorm(n_tips*k, 0, scale)), nrow=k, ncol=n_tips)
+    me_values[[i]] <- me_matrix
+  }
+  
+  return(me_values)
+}
+
+# FIXED: Simulate traits using mixture model with per-trait theta
+simulate_traits_mixture <- function(tree, phylo_model_template, n_traits, me_values, p_noise, params) {
+  trait_list <- list()
+  trait_types <- character(n_traits)
+  trait_thetas <- numeric(n_traits)  # Store theta for each trait
+  trait_x0s <- numeric(n_traits)     # Store X0 for each trait
+  
+  n_tips <- length(tree$tip.label)
+  
+  # Determine which traits are phylogenetic vs noise
+  is_noise <- rbinom(n_traits, 1, p_noise) == 1
+  n_phylo <- sum(!is_noise)
+  n_noise <- sum(is_noise)
+  
+  for (i in 1:n_traits) {
+    # Sample theta for THIS specific trait
+    if (params$sample_theta) {
+      trait_theta <- rnorm(1, mean = params$theta_mean, sd = params$theta_sd)
+    } else {
+      trait_theta <- params$theta_mean  # Use fixed value if not sampling
+    }
+    trait_thetas[i] <- trait_theta
+    
+    # Set X0 for this trait
+    if (params$x0_follows_theta) {
+      trait_x0 <- trait_theta  # X0 = theta (equilibrium start)
+    } else {
+      trait_x0 <- params$x0   # Use fixed X0
+    }
+    trait_x0s[i] <- trait_x0
+    
+    if (is_noise[i]) {
+      # Noise trait: generate Gaussian white noise centered at this trait's theta
+      trait_data <- matrix(rnorm(n_tips, mean = trait_theta, sd = params$sigma_noise), nrow=1)
+      trait_types[i] <- "noise"
+    } else {
+      # Phylogenetic trait: create OU model with this trait's specific theta and X0
+      phylo_model <- phylo_model_template  # Copy template
+      phylo_model$Theta[1,] <- trait_theta  # Set trait-specific theta
+      phylo_model$X0[1] <- trait_x0         # Set trait-specific X0
+      
+      # Simulate using trait-specific OU model
+      trait_data <- PCMSim(tree, phylo_model, phylo_model$X0, verbose=FALSE)
+      trait_data <- trait_data[,1:n_tips]
+      trait_types[i] <- "phylo"
+    }
+    
+    # Add measurement error to both types
+    trait_data_with_error <- trait_data + me_values[[i]] * matrix(rnorm(n_tips), nrow=1)
+ 
+    # Store the simulated trait
+    trait_list[[i]] <- trait_data_with_error
+  }
+  
+  return(list(
+    traits = trait_list, 
+    types = trait_types, 
+    thetas = trait_thetas,  # Per-trait theta values
+    x0s = trait_x0s,        # Per-trait X0 values
+    n_phylo = n_phylo, 
+    n_noise = n_noise
+  ))
+}
+
+# Generate a random parameter set within specified ranges
+generate_random_params <- function(args) {
+  params <- list()
+  
+  # Sample shared parameters (same across all traits in this simulation)
+  params$h <- runif(1, args$h_min, args$h_max)
+  params$sigma <- runif(1, args$sigma_min, args$sigma_max)
+  params$sigma_noise <- runif(1, args$sigma_noise_min, args$sigma_noise_max)
+  params$p_noise <- runif(1, args$p_min, args$p_max)
+  
+  # Per-trait theta sampling parameters
+  params$sample_theta <- args$sample_theta
+  params$theta_mean <- args$theta_mean
+  params$theta_sd <- args$theta_sd
+  
+  # X0 settings
+  params$x0_follows_theta <- args$x0_follows_theta
+  params$x0 <- args$x0
+  
+  # Other settings
+  params$verbose <- args$verbose
+  
+  return(params)
+}
+
+# Create an informative filename based on parameters
+create_filename <- function(output_dir, params, repeat_num) {
+  # Format parameter values with 2-3 decimal places
+  h_str <- paste0("H", sprintf("%.2f", params$h))
+  sigma_str <- paste0("S", sprintf("%.2f", params$sigma))
+  sigma_noise_str <- paste0("SN", sprintf("%.2f", params$sigma_noise))
+  p_str <- paste0("P", sprintf("%.3f", params$p_noise))
+  
+  # Add theta sampling info
+  if (params$sample_theta) {
+    theta_str <- paste0("ThetaSamp_", sprintf("%.1f", params$theta_sd))
+  } else {
+    theta_str <- paste0("ThetaFix_", sprintf("%.1f", params$theta_mean))
+  }
+  
+  # Combine into filename
+  filename <- file.path(output_dir, paste0("sim_", repeat_num, "_", h_str, "_", sigma_str, "_", sigma_noise_str, "_", p_str, "_", theta_str, ".rds"))
+  
+  return(filename)
+}
+
+# Main function
+main <- function() {
+  # Parse command line arguments
+  args <- parse_cmd_args()
+  
+  # Set random seed if provided
+  if (!is.null(args$seed)) {
+    set.seed(args$seed)
+  }
+  
+  # Create output directory if it doesn't exist
+  if (!dir.exists(args$output_dir)) {
+    dir.create(args$output_dir, recursive = TRUE)
+    if (!args$quiet) cat("Created output directory:", args$output_dir, "\n")
+  }
+  
+  # Load or create tree
+  if (!args$quiet) cat("Loading phylogenetic tree... ")
+  tree <- get_tree(args$tree, args$size, args$quiet)
+  
+  # Summary dataframe to record all parameter combinations
+  summary_df <- data.frame()
+  
+  # Print simulation header
+  if (!args$quiet) {
+    cat("\nStarting mixture model simulation with per-trait theta:\n")
+    cat("- Repeats:", args$repeats, "\n")
+    cat("- Traits per repeat:", args$ntraits, "\n")
+    cat("- H range: [", args$h_min, ",", args$h_max, "]\n")
+    cat("- Sigma range: [", args$sigma_min, ",", args$sigma_max, "]\n")
+    cat("- Sigma_noise range: [", args$sigma_noise_min, ",", args$sigma_noise_max, "]\n")
+    cat("- Noise probability range: [", args$p_min, ",", args$p_max, "]\n")
+    cat("- Theta sampling:", ifelse(args$sample_theta, 
+                                    paste("N(", args$theta_mean, ",", args$theta_sd, ") per trait"), 
+                                    paste("Fixed at", args$theta_mean)), "\n")
+    cat("- X0 setting:", ifelse(args$x0_follows_theta, "X0 = theta per trait", paste("Fixed at", args$x0)), "\n\n")
+  }
+  
+  # Progress tracking
+  progress_interval <- max(1, args$repeats %/% 10)
+  
+  # Perform repeats with different parameter combinations
+  for (repeat_num in 1:args$repeats) {
+    # Show progress
+    if (!args$quiet && (repeat_num %% progress_interval == 0 || repeat_num == 1)) {
+      cat("Progress:", repeat_num, "/", args$repeats, "\n")
+    }
+    
+    if (args$verbose) cat(paste0("\n=== Repeat ", repeat_num, " of ", args$repeats, " ===\n"))
+    
+    # Generate random parameters
+    params <- generate_random_params(args)
+    
+    # Print parameter values
+    if (args$verbose) {
+      cat("Shared parameters: H =", sprintf("%.3f", params$h), 
+          "Sigma =", sprintf("%.3f", params$sigma),
+          "Sigma_noise =", sprintf("%.3f", params$sigma_noise),
+          "P_noise =", sprintf("%.3f", params$p_noise), "\n")
+      cat("Theta settings: Sample =", params$sample_theta, 
+          "Mean =", sprintf("%.3f", params$theta_mean),
+          "SD =", sprintf("%.3f", params$theta_sd), "\n")
+    }
+    
+    # Initialize model template (shared parameters only)
+    if (args$verbose) cat("Initializing OU model template...\n")
+    phylo_model_template <- init_model_template(tree, params)
+    
+    # Generate measurement error values
+    if (args$verbose) cat("Generating measurement error matrices...\n")
+    me_values <- generate_me_values(args$ntraits, length(tree$tip.label), scale=args$me_scale)
+    
+    # Simulate traits using mixture model with per-trait theta
+    if (args$verbose) cat(paste0("Simulating ", args$ntraits, " traits under mixture model (per-trait theta)...\n"))
+    sim_result <- simulate_traits_mixture(tree, phylo_model_template, args$ntraits, me_values, params$p_noise, params)
+    
+    if (args$verbose) {
+      cat("Simulated", sim_result$n_phylo, "phylogenetic traits and", sim_result$n_noise, "noise traits\n")
+      cat("Theta range across traits: [", round(min(sim_result$thetas), 3), ",", round(max(sim_result$thetas), 3), "]\n")
+      cat("Mean theta across traits:", round(mean(sim_result$thetas), 3), "\n")
+    }
+    
+    # Add diagnostic section
+    if (args$verbose) {
+      cat("\n=== PARAMETERIZATION DIAGNOSTIC ===\n")
+      cat("Simulation parameters:\n")
+      cat("  H =", phylo_model_template$H[1,1], "\n")
+      cat("  Sigma_x =", phylo_model_template$Sigma_x[1], "\n")
+      cat("  Sigma_noise =", params$sigma_noise, "\n")
+      cat("  Tree height =", max(vcv(tree)[1,]), "\n")
+
+      # Test a few traits from each process
+      phylo_indices <- which(sim_result$types == "phylo")[1:min(3, sum(sim_result$types == "phylo"))]
+      noise_indices <- which(sim_result$types == "noise")[1:min(3, sum(sim_result$types == "noise"))]
+      
+      if (length(phylo_indices) > 0) {
+        cat("Sample phylogenetic trait statistics:\n")
+        for (idx in phylo_indices) {
+          trait_vals <- as.vector(sim_result$traits[[idx]])
+          cat("  Trait", idx, "(theta =", round(sim_result$thetas[idx], 3), "): Mean =", 
+              round(mean(trait_vals), 3), "Var =", round(var(trait_vals), 3), "\n")
+        }
+      }
+      
+      if (length(noise_indices) > 0) {
+        cat("Sample noise trait statistics:\n")
+        for (idx in noise_indices) {
+          trait_vals <- as.vector(sim_result$traits[[idx]])
+          cat("  Trait", idx, "(theta =", round(sim_result$thetas[idx], 3), "): Mean =", 
+              round(mean(trait_vals), 3), "Var =", round(var(trait_vals), 3), "\n")
+        }
+      }
+
+      # Expected stationary variance for OU: sigma²/(2*alpha)
+      expected_var_phylo <- phylo_model_template$Sigma_x[1]^2 / (2 * phylo_model_template$H[1,1])
+      expected_var_noise <- params$sigma_noise^2
+
+      cat("Expected variances:\n")
+      cat("  Phylogenetic process:", round(expected_var_phylo, 3), "\n")
+      cat("  Noise process:", round(expected_var_noise, 3), "\n")
+    }
+
+    # Create result object with per-trait information
+    result <- list(
+      trait_list = sim_result$traits,
+      trait_types = sim_result$types,
+      trait_thetas = sim_result$thetas,  # NEW: per-trait theta values
+      trait_x0s = sim_result$x0s,        # NEW: per-trait X0 values
+      me_values = me_values,
+      tree = tree,
+      parameters = list(
+        H = params$h,
+        Sigma_x = params$sigma,
+        Sigma_noise = params$sigma_noise,
+        P_noise = params$p_noise,
+        Theta_mean = params$theta_mean,      # Distribution center
+        Theta_sd = params$theta_sd,          # Distribution spread
+        Sample_theta = params$sample_theta,  # Sampling flag
+        X0_follows_theta = params$x0_follows_theta,
+        X0_fixed = params$x0
+      ),
+      n_traits = args$ntraits,
+      n_phylo_traits = sim_result$n_phylo,
+      n_noise_traits = sim_result$n_noise,
+      tip_labels = tree$tip.label
+    )
+    
+    # Create informative filename
+    output_file <- create_filename(args$output_dir, params, repeat_num)
+    
+    # Save results
+    if (args$verbose) cat(paste0("Saving results to ", output_file, "...\n"))
+    saveRDS(result, file = output_file)
+    
+    # Add row to summary dataframe
+    summary_row <- data.frame(
+      repeat_num = repeat_num,
+      h = params$h,
+      sigma = params$sigma,
+      sigma_noise = params$sigma_noise,
+      p_noise = params$p_noise,
+      sample_theta = params$sample_theta,
+      theta_mean = params$theta_mean,
+      theta_sd = params$theta_sd,
+      theta_range_min = min(sim_result$thetas),
+      theta_range_max = max(sim_result$thetas),
+      theta_empirical_mean = mean(sim_result$thetas),
+      theta_empirical_sd = sd(sim_result$thetas),
+      n_phylo_traits = sim_result$n_phylo,
+      n_noise_traits = sim_result$n_noise,
+      stationary_var_phylo = params$sigma^2 / (2 * params$h),
+      stationary_var_noise = params$sigma_noise^2,
+      filename = basename(output_file)
+    )
+    summary_df <- rbind(summary_df, summary_row)
+  }
+  
+  # Save summary dataframe
+  summary_file <- file.path(args$output_dir, "simulation_summary.csv")
+  write.csv(summary_df, file = summary_file, row.names = FALSE)
+  if (!args$quiet) cat("\nSummary saved to:", summary_file, "\n")
+  
+  # Print final summary
+  if (!args$quiet) {
+    cat("\n=== Simulation Complete ===\n")
+    cat("Total simulations:", args$repeats, "\n")
+    cat("Average phylogenetic traits per simulation:", round(mean(summary_df$n_phylo_traits), 1), "\n")
+    cat("Average noise traits per simulation:", round(mean(summary_df$n_noise_traits), 1), "\n")
+    cat("Theta sampling mode:", ifelse(args$sample_theta, "Per-trait sampling", "Fixed value"), "\n")
+    if (args$sample_theta) {
+      cat("Average theta range per simulation: [", 
+          round(mean(summary_df$theta_range_min), 3), ",", 
+          round(mean(summary_df$theta_range_max), 3), "]\n")
+      cat("Average empirical theta SD:", round(mean(summary_df$theta_empirical_sd), 3), "\n")
+    }
+    cat("Average stationary variance - phylogenetic process:", round(mean(summary_df$stationary_var_phylo), 3), "\n")
+    cat("Average variance - noise process:", round(mean(summary_df$stationary_var_noise), 3), "\n")
+    cat("Results saved to:", args$output_dir, "\n")
+  }
+}
+
+# Run the main function if script is called directly
+if (!interactive()) {
+  main()
+}
